@@ -26,6 +26,9 @@ struct ComputeTypeTraits<float> {
 
 template <typename T, typename ComputeType = T>
 struct CublasLtGemm {
+  CublasLtGemm();
+  ~CublasLtGemm();
+
   cublasLtHandle_t handle_;
 
   cublasLtMatrixLayout_t a_desc_;
@@ -48,7 +51,7 @@ struct CublasLtGemm {
       ComputeTypeTraits<ComputeType>::kScaleType;
 
   void *workspace_;
-  int workspace_size_;
+  size_t workspace_size_;
 
   const void *a_;
   const void *b_;
@@ -56,21 +59,73 @@ struct CublasLtGemm {
 
   void init(T *c, const T *a, const T *b, int m, int n, int k);
   bool run();
+  bool run_algo(int algo_idx = 0);
+  int algo_count() const { return ret_algo_num_; }
 };
+
+template <typename T, typename ComputeType>
+CublasLtGemm<T, ComputeType>::CublasLtGemm()
+    : handle_(nullptr),
+      a_desc_(nullptr),
+      b_desc_(nullptr),
+      c_desc_(nullptr),
+      matmul_desc_(nullptr),
+      preference_(nullptr),
+      ret_algo_num_(0),
+      workspace_(nullptr),
+      workspace_size_(0),
+      a_(nullptr),
+      b_(nullptr),
+      c_(nullptr) {}
+
+template <typename T, typename ComputeType>
+CublasLtGemm<T, ComputeType>::~CublasLtGemm() {
+  if (workspace_ != nullptr) {
+    cudaFree(workspace_);
+  }
+  if (preference_ != nullptr) {
+    cublasLtMatmulPreferenceDestroy(preference_);
+  }
+  if (matmul_desc_ != nullptr) {
+    cublasLtMatmulDescDestroy(matmul_desc_);
+  }
+  if (a_desc_ != nullptr) {
+    cublasLtMatrixLayoutDestroy(a_desc_);
+  }
+  if (b_desc_ != nullptr) {
+    cublasLtMatrixLayoutDestroy(b_desc_);
+  }
+  if (c_desc_ != nullptr) {
+    cublasLtMatrixLayoutDestroy(c_desc_);
+  }
+  if (handle_ != nullptr) {
+    cublasLtDestroy(handle_);
+  }
+}
+
+template <typename T, typename ComputeType>
+bool CublasLtGemm<T, ComputeType>::run_algo(int algo_idx) {
+  if (algo_idx < 0 || algo_idx >= ret_algo_num_) {
+    printf("invalid cublasLt algo_idx = %d, ret_algo_num = %d\n", algo_idx,
+           ret_algo_num_);
+    return false;
+  }
+
+  auto algo = algos_[algo_idx];
+  check(cublasLtMatmul(handle_, matmul_desc_, &alpha_, a_, a_desc_, b_,
+                       b_desc_, &beta_, c_, c_desc_, c_, c_desc_,
+                       &(algo.algo), workspace_, workspace_size_, 0));
+  return true;
+}
 
 template <typename T, typename ComputeType>
 bool CublasLtGemm<T, ComputeType>::run() {
   for (int i = 0; i < ret_algo_num_; ++i) {
-    auto algo = algos_[i];
-
     /*
     printf("algo-id = %d, workspace_size = %zu, waves = %f\n", i,
     algo.workspaceSize, algo.wavesCount);
     */
-
-    check(cublasLtMatmul(handle_, matmul_desc_, &alpha_, a_, a_desc_, b_,
-                         b_desc_, &beta_, c_, c_desc_, c_, c_desc_,
-                         &(algo.algo), workspace_, workspace_size_, 0));
+    run_algo(i);
   }
   return true;
 }
@@ -79,7 +134,11 @@ template <typename T, typename ComputeType>
 void CublasLtGemm<T, ComputeType>::init(T *c, const T *a, const T *b, int m,
                                         int n, int k) {
   auto version = cublasLtGetVersion();
-  printf("cublasLt version: %zu\n", version);
+  static bool version_printed = false;
+  if (!version_printed) {
+    printf("cublasLt version: %zu\n", version);
+    version_printed = true;
+  }
 
   check(cublasLtCreate(&handle_));
 
@@ -121,10 +180,18 @@ void CublasLtGemm<T, ComputeType>::init(T *c, const T *a, const T *b, int m,
 
   alpha_ = 1.f;
   beta_ = 0.f;
-  workspace_ = nullptr;
-  workspace_size_ = 0;
+  workspace_size_ = 64 * 1024 * 1024;
+  cudaError_t cuda_err = cudaMalloc(&workspace_, workspace_size_);
+  if (cuda_err != cudaSuccess) {
+    printf("cudaMalloc workspace failed: %s\n", cudaGetErrorString(cuda_err));
+    workspace_ = nullptr;
+    workspace_size_ = 0;
+  }
 
   cublasLtMatmulPreferenceCreate(&preference_);
+  check(cublasLtMatmulPreferenceSetAttribute(
+      preference_, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_,
+      sizeof(workspace_size_)));
 
   cublasLtMatmulAlgoGetHeuristic(handle_, matmul_desc_, a_desc_, b_desc_,
                                  c_desc_, c_desc_, preference_, kAlgoMaxNum,

@@ -30,14 +30,19 @@ __global__ void copy_global_shm_register(const T *Aptr)
     auto stAsA = s2r_thr_copy.retile_S(tAsA);
     auto tArA = s2r_thr_copy.partition_D(rA);
     cute::copy(s2r_tiled_copy, stAsA, tArA);
-
+    cp_async_fence();
+    cp_async_wait<0>();
+    __syncthreads();
     if (idx == 0)
     {
         // ((_8,_1),_4,_4)
         // (CPY, CPY_M, CPY_N)
         // 其中CPY由copy_op決定，這裡對2個OP都是128bit=16bytes=8half, 確定了copy的基本操作單位。
         // CPY_M = M / (ThrLayout_M * ValLayout_M), CPY_N = N / (ThrLayout_N * ValLayout_N), CPY_M、CPY_N和TiledCopy共同確定了拷貝的元素數量。
-
+        for(int i=0; i< 64; ++i){
+            if(i % 8 == 0 && i !=0 ) printf("\n");
+            printf(" %f ",float(shm_data[i * 8]));
+        }
         PRINT("tAgA", tAgA.shape());
         PRINT("tAsA", tAsA.shape());
         PRINT("stAsA", stAsA.shape());
@@ -112,7 +117,7 @@ int main()
 
     // logical layout (8,32) to physical layout (8,8,8)
     using SmemLayoutAtom = decltype(composition(
-        Swizzle<3, 3, 3>{},
+        Swizzle<2, 3, 3>{},
         make_layout(make_shape(Int<8>{}, Int<32>{}),
                     make_stride(Int<32>{}, Int<1>{}))));
     using SmemLayout = decltype(tile_to_shape(SmemLayoutAtom{},
@@ -135,10 +140,15 @@ int main()
                                  make_layout(make_shape(Int<1>{}, Int<8>{}))));
 
     T *Aptr;
-    cudaMalloc(&Aptr, sizeof(T) * M * N);
+    cudaMallocManaged(&Aptr, sizeof(T) * M * N);
+
+    for(int i=0; i < 128 * 128; ++i){
+        Aptr[i] = __float2half(float(i / 8));
+    }
+
     dim3 block(128);
     cudaEventRecord(start);
-    int count = 100;
+    int count = 1;
     for (int i = 0; i < count; ++i)
     {
         copy_global_shm_register<T, G2SCopy, S2RCopy, SmemLayout, M, N><<<1, block, shm_size>>>(Aptr);

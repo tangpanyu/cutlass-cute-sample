@@ -1,18 +1,32 @@
 #include <cuda.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "util.h"
 #include "detail/cublaslt-gemm.h"
 #include "detail/data.h"
 
-// #define PRINT_INFO
+#define PRINT_INFO
 using namespace cute;
+
+#define CUDA_CHECK(call)                                                   \
+  do                                                                       \
+  {                                                                        \
+    cudaError_t err = call;                                                \
+    if (err != cudaSuccess)                                                \
+    {                                                                      \
+      printf("CUDA error %s:%d: %s (%s)\n", __FILE__, __LINE__,            \
+             cudaGetErrorString(err), #call);                              \
+      exit(1);                                                             \
+    }                                                                      \
+  } while (0)
 
 namespace config
 {
   using namespace cute;
-
-  template <typename T_, int kTileM_ = 128, int kTileN_ = 128, int kTileK_ = 32>
+  // 32 不太行，64 byte 不够一个sector， 128byte 一个sector
+  template <typename T_, int kTileM_ = 128, int kTileN_ = 128, int kTileK_ = 32,
+            int kThreadblockSwizzleN_ = 1>
   struct GemmConfigV1
   {
     using T = T_;
@@ -20,6 +34,7 @@ namespace config
     static constexpr int kTileM = kTileM_;
     static constexpr int kTileN = kTileN_;
     static constexpr int kTileK = kTileK_;
+    static constexpr int kThreadblockSwizzleN = kThreadblockSwizzleN_;
 
     // shared memory layout
     using SmemLayoutAtom = decltype(composition(
@@ -66,7 +81,8 @@ namespace config
   };
 
   template <typename T_, int kTileM_ = 128, int kTileN_ = 128, int kTileK_ = 32,
-            int kStage_ = 3, int kSmemLayoutCBatch_ = 4>
+            int kStage_ = 3, int kSmemLayoutCBatch_ = 4,
+            int kThreadblockSwizzleN_ = 1>
   struct GemmConfig
   {
     using T = T_;
@@ -75,7 +91,10 @@ namespace config
     static constexpr int kTileN = kTileN_;
     static constexpr int kTileK = kTileK_;
     static constexpr int kStage = kStage_;
+
+    // 这里的kSmemLayoutCBatch_表示一次经过kTileM和kTileN的SM80_16x8x16_F16F16F16F16_TNgemm结束后，会存在4个小矩阵也就是4次拷贝
     static constexpr int kSmemLayoutCBatch = kSmemLayoutCBatch_;
+    static constexpr int kThreadblockSwizzleN = kThreadblockSwizzleN_;
 
     // shared memory layout
     using SmemLayoutAtom = decltype(composition(
@@ -114,7 +133,7 @@ namespace config
     using S2RCopyAtomA = s2r_copy_atom;
     using S2RCopyAtomB = s2r_copy_atom;
 
-    // register to global via shared memory
+    // (32, 32, 16) 是因为MMA中，根据MMA来计算，M=16x2, N=16x2x2，K=16,16就是MMA的基础shape,M和N是经过MMAAtom后的结果
     using MNK = typename MMA::TiledShape_MNK;
     using SmemLayoutAtomC = decltype(composition(
         Swizzle<3, 3, 3>{}, make_layout(make_shape(get<0>(MNK{}), get<1>(MNK{})),
@@ -146,6 +165,59 @@ namespace config
 
 } // namespace config
 
+template <typename Config>
+__host__ __device__ int get_swizzle_n(int tiles_n)
+{
+  if (Config::kThreadblockSwizzleN >= 8 && tiles_n >= 6)
+  {
+    return 8;
+  }
+  if (Config::kThreadblockSwizzleN >= 4 && tiles_n >= 3)
+  {
+    return 4;
+  }
+  if (Config::kThreadblockSwizzleN >= 2 && tiles_n >= 2)
+  {
+    return 2;
+  }
+  return 1;
+}
+
+template <typename Config>
+__host__ dim3 get_swizzled_grid(int m, int n)
+{
+  int tiles_m = (m + Config::kTileM - 1) / Config::kTileM;
+  int tiles_n = (n + Config::kTileN - 1) / Config::kTileN;
+  int swizzle_n = get_swizzle_n<Config>(tiles_n);
+  return dim3(tiles_m * swizzle_n, (tiles_n + swizzle_n - 1) / swizzle_n);
+}
+
+template <typename Config>
+__device__ void get_swizzled_tile_coord(int m, int n, int &ix, int &iy)
+{
+  int tiles_m = (m + Config::kTileM - 1) / Config::kTileM;
+  int tiles_n = (n + Config::kTileN - 1) / Config::kTileN;
+  int swizzle_n = get_swizzle_n<Config>(tiles_n);
+
+  iy = blockIdx.x / swizzle_n;
+  ix = blockIdx.y * swizzle_n + ((blockIdx.x + iy) % swizzle_n);
+
+  if (ix >= tiles_n || iy >= tiles_m)
+  {
+    ix = -1;
+    iy = -1;
+  }
+}
+
+double gemm_tflops(int m, int n, int k, float elapsed_ms)
+{
+  if (elapsed_ms <= 0.0f)
+  {
+    return 0.0;
+  }
+  return (2.0 * m * n * k) / (elapsed_ms * 1.0e9);
+}
+
 // apply shm
 template <typename Config>
 __global__ void
@@ -172,8 +244,12 @@ gemm_opt_shm(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   T *Bshm = shm_data + cute::cosize(SmemLayoutA{});
 
   int idx = threadIdx.x;
-  int ix = blockIdx.x;
-  int iy = blockIdx.y;
+  int ix, iy;
+  get_swizzled_tile_coord<Config>(m, n, ix, iy);
+  if (ix < 0)
+  {
+    return;
+  }
 
   Tensor A = make_tensor(make_gmem_ptr((T *)Aptr), make_shape(m, k),
                          make_stride(k, Int<1>{})); // (M, K)
@@ -292,8 +368,12 @@ gemm_opt_p1(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   T *Bshm = shm_data + cute::cosize(SmemLayoutA{});
 
   int idx = threadIdx.x;
-  int ix = blockIdx.x;
-  int iy = blockIdx.y;
+  int ix, iy;
+  get_swizzled_tile_coord<Config>(m, n, ix, iy);
+  if (ix < 0)
+  {
+    return;
+  }
 
   Tensor A = make_tensor(make_gmem_ptr((T *)Aptr), make_shape(m, k),
                          make_stride(k, Int<1>{})); // (M, K)
@@ -462,8 +542,12 @@ gemm_opt_p2(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   T *Bshm = shm_data + cute::cosize(SmemLayoutA{});
 
   int idx = threadIdx.x;
-  int ix = blockIdx.x;
-  int iy = blockIdx.y;
+  int ix, iy;
+  get_swizzled_tile_coord<Config>(m, n, ix, iy);
+  if (ix < 0)
+  {
+    return;
+  }
 
   Tensor A = make_tensor(make_gmem_ptr((T *)Aptr), make_shape(m, k),
                          make_stride(k, Int<1>{})); // (M, K)
@@ -641,8 +725,12 @@ gemm_opt_final(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
   T *Bshm = shm_data + cute::cosize(SmemLayoutA{});
 
   int idx = threadIdx.x;
-  int ix = blockIdx.x;
-  int iy = blockIdx.y;
+  int ix, iy;
+  get_swizzled_tile_coord<Config>(m, n, ix, iy);
+  if (ix < 0)
+  {
+    return;
+  }
 
   Tensor A = make_tensor(make_gmem_ptr((T *)Aptr), make_shape(m, k),
                          make_stride(k, Int<1>{})); // (M, K)
@@ -737,11 +825,49 @@ gemm_opt_final(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
 
 #ifdef PRINT_INFO
   /*
+    一句话总结：
+    MMA和CPY表示一个线程所有的基本数据的Shape，MMA表示寄存器的数据Shape，CPY表示拷贝的基本单元数据Shape
+    _M,_N,_K表示重复次数，Warp的MMA需要在该方向循环多少次，线程的CPY需要在该方向循环多少次
+
+    MMA就是表示一个线程持有数据的Shape，比如(_2,_2,_2)表示MMA中一个线程有8个数据，不用管Stride
+    MMA_M表示Block 的 M 方向包含多少个 tiled-MMA tile。
+    比如这里是4,表示128（kTileM) / 32(128个线程的一次MMA的M维度，在M方向有2个warp，也就是2x16=32) = 4
+    MMA_K表示kTileK/ 16(一个SM80_16x8x16_F16F16F16F16_TN MMA的k维度 = 16) = 2
+    MMA_N则表示kTileN / 8(base), 这里因为是在N上重复了一次，所以除以16,就等于128/ 16 = 8
+    而tCrD的MMA是(_2,_2)，则表示16x8,每个线程有4个数据，Shape是(_2,_2)，Stride不管
+
+    CPY就是要拷贝的基本shape,每个的shape都不同，比如(8, 1)就是k-major的8个数据，每个线程拷贝的数量
+    CPY_M就是一个Atom要在kTileM上拷贝几次才拷贝完，也可以理解成一个线程要拷贝几次CPY才拷贝完这次需要的数据
+    比如这里拷贝一次的32x32的shape,kTileM是128,也就是在kTileM拷贝4次
+    CPY_K和CPY_N和上同理
+
+    其中k是 K / kTileK，这里A和B的k不一样因为上面是作者的维度，也就是1024,我改写成4096了，也就是 1024 / 32 =32
+    kStage就是预先规定好的，这里是3
+
+    tCrD的(_2,_2)表示16x8的Atom Shape，一个线程保留的数据Shape就是(2, 2)
+
+    这里是选gA的0的原因，因为值需要mma 计算一次的一组寄存器数量，而不是把所有的gA都加载到片上的寄存器数量
+    也就是说，覆盖了M和K方向上循环的寄存器
     tCrA = thr_mma.partition_fragment_A(gA(_, _, 0))  (MMA, MMA_M, MMA_K) : ((_2,_2,_2),_4,_2)
-    tAgA_copy = g2s_thr_copy_a.partition_S(gA)  (CPY, CPY_M, CPY_K, k) : ((_8,_1),_4,_1,32)
+    128 / 32 = 4, 32 / 32 = 1 ，k看下面
+    tCrA = thr_mma.partition_fragment_A(gA(_, _, 0))  (MMA, MMA_M, MMA_K) : ((_2,_2,_2),_4,_2)
+    tAgA_copy = g2s_thr_copy_a.partition_S(gA)  (CPY, CPY_M, CPY_K, k) : ((_8,_1),_4,_1,128)
     tAsA_copy = g2s_thr_copy_a.partition_D(sA)  (CPY, CPY_M, CPY_K, kStage) : ((_8,_1),_4,_1,_3)
     tAsA = s2r_thr_copy_a.partition_S(sA)  (CPY, CPY_M, CPY_K, kStage) : ((_8,_1),_4,_2,_3)
     tCrA_view = s2r_thr_copy_a.retile_D(tCrA) (CPY, CPY_M, CPY_K) : ((_8,_1),_4,_2)
+
+    tCrB = thr_mma.partition_fragment_B(gB(_, _, 0))  (MMA, MMA_N, MMA_K) : ((_2,_2),_8,_2)
+    上面32是因为shape不同,4096维度都是128,也就是4096/32, k表示的是想循环次数
+    tBgB_copy = g2s_thr_copy_b.partition_S(gB)  (CPY, CPY_M, CPY_K, k) : ((_8,_1),_4,_1,128)
+    tBsB_copy = g2s_thr_copy_b.partition_D(sB)  (CPY, CPY_M, CPY_K, kStage) : ((_8,_1),_4,_1,_3)
+    tBsB = s2r_thr_copy_b.partition_S(sB)  (CPY, CPY_M, CPY_K, kStage) : ((_8,_1),_4,_2,_3)
+    tCrB_view = s2r_thr_copy_b.retile_D(tCrB) (CPY, CPY_M, CPY_K) : ((_8,_1),_4,_2)
+
+    tCrD = thr_mma.partition_fragment_C(gD); (MMA, MMA_M, MMA_N) : ((_2,_2),_4,_8)
+
+    tCrA.stride = thr_mma.partition_fragment_A(gA(_, _, 0))  (MMA, MMA_M, MMA_K) : ((_1,_2,_4),_8,_32)
+    tCrB.stride = thr_mma.partition_fragment_B(gB(_, _, 0))  (MMA, MMA_M, MMA_K) : ((_1,_2),_4,_32)
+    tCrD.stride = thr_mma.partition_fragment_C(gD); (MMA, MMA_M, MMA_N) : ((_1,_2),_4,_16)
   */
   if (threadIdx.x == 0 && ix == 0 && iy == 0)
   {
@@ -750,6 +876,18 @@ gemm_opt_final(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
     PRINT("tAsA_copy = g2s_thr_copy_a.partition_D(sA)  (CPY, CPY_M, CPY_K, kStage)", tAsA_copy.shape());
     PRINT("tAsA = s2r_thr_copy_a.partition_S(sA)  (CPY, CPY_M, CPY_K, kStage)", tAsA.shape());
     PRINT("tCrA_view = s2r_thr_copy_a.retile_D(tCrA) (CPY, CPY_M, CPY_K)", tCrA_view.shape());
+
+    PRINT("tCrB = thr_mma.partition_fragment_B(gB(_, _, 0))  (MMA, MMA_M, MMA_K)", tCrB.shape());
+    PRINT("tBgB_copy = g2s_thr_copy_b.partition_S(gB)  (CPY, CPY_M, CPY_K, k)", tBgB_copy.shape());
+    PRINT("tBsB_copy = g2s_thr_copy_b.partition_D(sB)  (CPY, CPY_M, CPY_K, kStage)", tBsB_copy.shape());
+    PRINT("tBsB = s2r_thr_copy_b.partition_S(sB)  (CPY, CPY_M, CPY_K, kStage)", tBsB.shape());
+    PRINT("tCrB_view = s2r_thr_copy_b.retile_D(tCrB) (CPY, CPY_M, CPY_K)", tCrB_view.shape());
+
+    PRINT("tCrD = thr_mma.partition_fragment_C(gD); (MMA, MMA_M, MMA_N)", tCrD.shape());
+
+    PRINT("tCrA.stride = thr_mma.partition_fragment_A(gA(_, _, 0))  (MMA, MMA_M, MMA_K)", tCrA.stride());
+    PRINT("tCrB.stride = thr_mma.partition_fragment_B(gB(_, _, 0))  (MMA, MMA_M, MMA_K)", tCrB.stride());
+    PRINT("tCrD.stride = thr_mma.partition_fragment_C(gD); (MMA, MMA_M, MMA_N)", tCrD.stride());
   }
 #endif
 #pragma unroll 1
@@ -806,6 +944,7 @@ gemm_opt_final(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
 
   auto r2s_tiled_copy_c = make_tiled_copy_C(R2SCopyAtomC{}, tiled_mma);
   auto r2s_thr_copy_c = r2s_tiled_copy_c.get_slice(idx);
+  // retile相当于Pytorch的view,重新换个shape和stride,S和D类似，就是source和destination
   auto tCrC_r2s = r2s_thr_copy_c.retile_S(tCrD);  // (CPY, CPY_M, CPY_N)
   auto tCsC_r2s = r2s_thr_copy_c.partition_D(sC); // (CPY, _1, _1, pipe)
 
@@ -819,13 +958,18 @@ gemm_opt_final(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
 
 #ifdef PRINT_INFO
   /*
-    sC : (_32,_32,_2)
+    (_2,(_2,_2)第一个2是2个half一个int,（2,2）表示线程的数据排布是2行2列，根据mmac的layout来的，也就是r2c,r的CPY，拷贝单元
+    CPY_M表示最终的kTileM x kTileN的结果矩阵，在M维度一个线程需要拷贝4次，
+    比如128(kTileM) / 32(MMA的基本矩阵，32x32的矩阵，一个线程是8个数据) = 4
+    CPY_N同理
+    sC : (_32,_32,_4)
     tCrC_r2s = r2s_thr_copy_c.retile_S(tCrD)  (CPY, CPY_M, CPY_N) : ((_2,(_2,_2)),_4,_4)
-    tCsC_r2s = r2s_thr_copy_c.partition_D(sC)  (CPY, _1, _1, pipe) : ((_2,(_2,_2)),_1,_1,_2)
-    tCsC_s2g = s2g_thr_copy_c.partition_S(sC)  (CPY, _1, _1, pipe) : ((_8,_1),_1,_1,_2)
+    tCsC_r2s = r2s_thr_copy_c.partition_D(sC)  (CPY, _1, _1, pipe) : ((_2,(_2,_2)),_1,_1,_4)
+    tCsC_s2g = s2g_thr_copy_c.partition_S(sC)  (CPY, _1, _1, pipe) : ((_8,_1),_1,_1,_4)
     tCgC_s2g = s2g_thr_copy_c.partition_D(gD)  (CPY, CPY_M, CPY_N) : ((_8,_1),_4,_4)
     tCgC_s2gx = group_modes<1, 3>(tCgC_s2g) (CPY_, CPY_MN) : ((_8,_1),(_4,_4))
     tCrC_r2sx = group_modes<1, 3>(tCrC_r2s) (CPY_, CPY_MN) : ((_2,(_2,_2)),(_4,_4))
+    tiled_mma::TiledShape_MNK  : (_32,_32,_16)
   */
   if (threadIdx.x == 0 && ix == 0 && iy == 0)
   {
@@ -836,6 +980,7 @@ gemm_opt_final(void *Dptr, const void *Aptr, const void *Bptr, int m, int n,
     PRINT("tCgC_s2g = s2g_thr_copy_c.partition_D(gD)  (CPY, CPY_M, CPY_N)", tCgC_s2g.shape());
     PRINT("tCgC_s2gx = group_modes<1, 3>(tCgC_s2g) (CPY_, CPY_MN)", tCgC_s2gx.shape());
     PRINT("tCrC_r2sx = group_modes<1, 3>(tCrC_r2s) (CPY_, CPY_MN)", tCrC_r2sx.shape());
+    PRINT("tiled_mma::TiledShape_MNK (M, N, K)", typename TiledMMA::TiledShape_MNK{});
   }
 #endif
 
@@ -880,11 +1025,43 @@ int main(int argc, char *argv[])
 
   srand(1000);
 
-  int M = 1024*64;
-  int N = 128;
-  int K = 1024;
+  int M = 4096;
+  int N = 4096;
+  int K = 4096;
 
   int count = 100;
+  int warmup = 5;
+  int compare_start = 1024;
+  int compare_end = 8192;
+  int compare_step = 1024;
+
+  if (algo == "compare4096" || algo == "compare")
+  {
+    if (argc > 2)
+    {
+      compare_start = atoi(argv[2]);
+      compare_end = compare_start;
+    }
+    if (argc > 3)
+    {
+      compare_end = atoi(argv[3]);
+    }
+    if (argc > 4)
+    {
+      compare_step = atoi(argv[4]);
+    }
+    if (argc > 5)
+    {
+      count = atoi(argv[5]);
+    }
+    if (argc > 6)
+    {
+      warmup = atoi(argv[6]);
+    }
+    M = compare_end;
+    N = compare_end;
+    K = compare_end;
+  }
 
   T *Aptr;
   T *Bptr;
@@ -906,11 +1083,98 @@ int main(int argc, char *argv[])
 
   // print(typename decltype(gemm_config)::MMA{});
   // print(typename decltype(gemm_config)::SmemLayoutA{});
-  if (algo == "shm")
+  if (algo == "compare4096" || algo == "compare")
   {
-    config::GemmConfigV1<T, 128, 128, 32> gemm_config;
-    dim3 grid((N + gemm_config.kTileN - 1) / gemm_config.kTileN,
-              (M + gemm_config.kTileM - 1) / gemm_config.kTileM);
+    config::GemmConfig<T, 128, 128, 32, 3, 4, 4> gemm_config;
+    dim3 block(size(decltype(gemm_config)::MMA{}));
+    int shm_size = gemm_config.kShmSize;
+    CUDA_CHECK(cudaFuncSetAttribute(gemm_opt_final<decltype(gemm_config)>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    shm_size));
+
+    printf("GEMM compare sweep: count=%d, warmup=%d\n", count, warmup);
+    printf("%8s %12s %12s %14s %14s %8s %12s\n", "SIZE", "final_ms",
+           "cublas_ms", "final_TFLOPS", "cublas_TFLOPS", "algo",
+           "achieve");
+
+    for (int size = compare_start; size <= compare_end; size += compare_step)
+    {
+      M = size;
+      N = size;
+      K = size;
+      dim3 grid = get_swizzled_grid<decltype(gemm_config)>(M, N);
+
+      CUDA_CHECK(cudaMemset(Dptr, 0, sizeof(T) * M * N));
+      for (int it = 0; it < warmup; ++it)
+      {
+        gemm_opt_final<decltype(gemm_config)>
+            <<<grid, block, shm_size>>>(Dptr, Aptr, Bptr, M, N, K);
+      }
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaDeviceSynchronize());
+
+      CUDA_CHECK(cudaEventRecord(start));
+      for (int it = 0; it < count; ++it)
+      {
+        gemm_opt_final<decltype(gemm_config)>
+            <<<grid, block, shm_size>>>(Dptr, Aptr, Bptr, M, N, K);
+      }
+      CUDA_CHECK(cudaEventRecord(end));
+      CUDA_CHECK(cudaEventSynchronize(end));
+      CUDA_CHECK(cudaEventElapsedTime(&elapsedTime, start, end));
+      double final_ms = elapsedTime / count;
+      double final_tflops = gemm_tflops(M, N, K, final_ms);
+
+      CUDA_CHECK(cudaMemset(Dptr, 0, sizeof(T) * M * N));
+      CublasLtGemm<T> cublaslt_gemm;
+      cublaslt_gemm.init(Dptr, Aptr, Bptr, M, N, K);
+
+      int cublaslt_best_algo = -1;
+      double cublaslt_ms = 1.0e30;
+      int cublaslt_algo_count = cublaslt_gemm.algo_count();
+      if (cublaslt_algo_count <= 0)
+      {
+        printf("cuBLASLt returned no algorithms for size %d\n", size);
+        continue;
+      }
+
+      for (int algo_idx = 0; algo_idx < cublaslt_algo_count; ++algo_idx)
+      {
+        CUDA_CHECK(cudaMemset(Dptr, 0, sizeof(T) * M * N));
+        for (int it = 0; it < warmup; ++it)
+        {
+          cublaslt_gemm.run_algo(algo_idx);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int it = 0; it < count; ++it)
+        {
+          cublaslt_gemm.run_algo(algo_idx);
+        }
+        CUDA_CHECK(cudaEventRecord(end));
+        CUDA_CHECK(cudaEventSynchronize(end));
+        CUDA_CHECK(cudaEventElapsedTime(&elapsedTime, start, end));
+
+        double algo_ms = elapsedTime / count;
+        if (algo_ms < cublaslt_ms)
+        {
+          cublaslt_ms = algo_ms;
+          cublaslt_best_algo = algo_idx;
+        }
+      }
+
+      double cublaslt_tflops = gemm_tflops(M, N, K, cublaslt_ms);
+      printf("%8d %12.6f %12.6f %14.6f %14.6f %8d %11.2f%%\n", size,
+             final_ms, cublaslt_ms, final_tflops, cublaslt_tflops,
+             cublaslt_best_algo,
+             final_tflops / cublaslt_tflops * 100);
+    }
+  }
+  else if (algo == "shm")
+  {
+    config::GemmConfigV1<T, 128, 128, 32, 8> gemm_config;
+    dim3 grid = get_swizzled_grid<decltype(gemm_config)>(M, N);
     dim3 block(size(decltype(gemm_config)::MMA{}));
     int shm_size = gemm_config.kShmSize;
 
@@ -932,9 +1196,8 @@ int main(int argc, char *argv[])
   }
   else if (algo == "p1")
   {
-    config::GemmConfig<T, 128, 128, 32, 3> gemm_config;
-    dim3 grid((N + gemm_config.kTileN - 1) / gemm_config.kTileN,
-              (M + gemm_config.kTileM - 1) / gemm_config.kTileM);
+    config::GemmConfig<T, 128, 128, 32, 3, 4, 8> gemm_config;
+    dim3 grid = get_swizzled_grid<decltype(gemm_config)>(M, N);
     dim3 block(size(decltype(gemm_config)::MMA{}));
     int shm_size = gemm_config.kShmSize;
 
@@ -956,9 +1219,8 @@ int main(int argc, char *argv[])
   }
   else if (algo == "p2")
   {
-    config::GemmConfig<T, 128, 128, 32, 3> gemm_config;
-    dim3 grid((N + gemm_config.kTileN - 1) / gemm_config.kTileN,
-              (M + gemm_config.kTileM - 1) / gemm_config.kTileM);
+    config::GemmConfig<T, 128, 128, 32, 3, 4, 8> gemm_config;
+    dim3 grid = get_swizzled_grid<decltype(gemm_config)>(M, N);
     dim3 block(size(decltype(gemm_config)::MMA{}));
     int shm_size = gemm_config.kShmSize;
 
@@ -980,9 +1242,8 @@ int main(int argc, char *argv[])
   }
   else if (algo == "final")
   {
-    config::GemmConfig<T, 128, 128, 32, 3> gemm_config;
-    dim3 grid((N + gemm_config.kTileN - 1) / gemm_config.kTileN,
-              (M + gemm_config.kTileM - 1) / gemm_config.kTileM);
+    config::GemmConfig<T, 128, 128, 32, 3, 4, 8> gemm_config;
+    dim3 grid = get_swizzled_grid<decltype(gemm_config)>(M, N);
     dim3 block(size(decltype(gemm_config)::MMA{}));
     int shm_size = gemm_config.kShmSize;
 
@@ -991,7 +1252,7 @@ int main(int argc, char *argv[])
                          cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
     cudaEventRecord(start);
-    for (int it = 0; it < count; ++it)
+    for (int it = 0; it < 1; ++it)
     {
       gemm_opt_final<decltype(gemm_config)>
           <<<grid, block, shm_size>>>(Dptr, Aptr, Bptr, M, N, K);
